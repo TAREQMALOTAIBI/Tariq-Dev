@@ -172,8 +172,14 @@ interface LatencyArbMetrics {
   time: number;
 }
 
-let minArbThreshold = 0.10; // 10% minimum statistical price discrepancy
+let minArbThreshold = 0.12; // 12% minimum statistical price discrepancy
 let riskPercentage = 0.04; // 4% risk allocation per trade
+let tpTargetDelta = 0.15; // Take Profit: +15 cents (+35% to +50% gain)
+let stopLossDelta = 0.20; // Stop Loss: -20 cents
+let executionMode: "MAKER_LIMIT" | "SNIPER" = "MAKER_LIMIT";
+let maxTradesPerWindow = 1; // Strict 1 trade per 15-min cycle to prevent spamming
+let tradesInCurrentWindow = 0;
+let lastTradedWindowIndex: number | null = null;
 let latestArbMetrics: LatencyArbMetrics | null = null;
 
 // Position & Trade tracking
@@ -229,9 +235,9 @@ function normalCDF(x: number): number {
   return 0.5 * (1.0 + sign * y);
 }
 
-// Compute Volatility from Recent 1m Candles (Annualized/15m standard deviation)
+// Compute Volatility from Recent 1m Candles (Standard Deviation)
 function calculateRollingVolatility(): number {
-  if (candleMemory.length < 10) return 0.0035; // Default 0.35% per 15-min
+  if (candleMemory.length < 10) return 0.0025; // Default 0.25% per 15m
   const returns: number[] = [];
   for (let i = 1; i < candleMemory.length; i++) {
     const prev = candleMemory[i - 1].close;
@@ -254,12 +260,22 @@ function evaluateLatencyArbitrage(currentBtcPrice: number) {
   const windowMinute = currentMinute % 15;
   const currentWindowIndex = Math.floor(now.getTime() / (15 * 60 * 1000));
 
-  // If at start of 15m window or strike not set, record Strike Price
-  if (currentWindowStrikePrice === null || windowMinute === 0 && currentSeconds < 10) {
+  // Reset window trade counter when moving to a new 15m window
+  if (lastTradedWindowIndex !== currentWindowIndex) {
+    if (lastTradedWindowIndex !== null) {
+      tradesInCurrentWindow = 0;
+    }
+  }
+
+  // Synchronize Strike Price at minute 0 of 15m window
+  if (currentWindowStrikePrice === null || (windowMinute === 0 && currentSeconds < 10)) {
     if (currentWindowStrikePrice === null || Math.floor((now.getTime() - windowStartTime) / (15 * 60 * 1000)) > 0) {
-      currentWindowStrikePrice = currentBtcPrice;
+      // Find open price of current 15m candle from candleMemory if available
+      const current15mStartMs = now.getTime() - ((windowMinute * 60 + currentSeconds) * 1000);
+      const candleAtStart = candleMemory.find(c => Math.abs(c.openTime - current15mStartMs) < 65000);
+      currentWindowStrikePrice = candleAtStart ? candleAtStart.open : currentBtcPrice;
       windowStartTime = now.getTime();
-      addLog("INFO", `🎯 New 15m BTC Cycle Initialized! Strike Price Fixed at: $${currentBtcPrice.toFixed(2)}`);
+      addLog("INFO", `🎯 15m BTC Window Synced! Strike Price Fixed at: $${currentWindowStrikePrice.toFixed(2)}`);
     }
   }
 
@@ -272,42 +288,46 @@ function evaluateLatencyArbitrage(currentBtcPrice: number) {
   const secondsRemainingInWindow = Math.max(900 - secondsElapsed, 5);
   const timeFraction = secondsRemainingInWindow / 900; // Fraction of 15-min remaining
 
-  // Dynamic Volatility of BTC in 15-min timeframe
-  const vol = calculateRollingVolatility() * Math.sqrt(Math.max(timeFraction, 0.05)) * strike;
+  // Robust BTC 15-minute standard deviation in USD
+  // A realistic 15m BTC move standard deviation is ~$120 to $300
+  const historicalVol = calculateRollingVolatility() * strike * Math.sqrt(Math.max(timeFraction, 0.05));
+  const minRealisticVol = Math.max(100 * Math.sqrt(Math.max(timeFraction, 0.08)), 25);
+  const vol = Math.max(historicalVol, minRealisticVol);
 
-  // Real-time Theoretical / Fair Binary Option Probability via d2 normal cumulative distribution:
-  // z = (P_t - Strike) / (Volatility_window)
+  // Real-time Theoretical / Fair Binary Option Probability via d2 normal CDF:
   const zScore = vol > 0 ? priceDeltaUsd / vol : 0;
-  
   let rawFairYes = normalCDF(zScore);
-  // Boundary clamping for realistic market pricing
-  rawFairYes = Math.max(0.03, Math.min(0.97, rawFairYes));
+  // Clamping for realistic market pricing
+  rawFairYes = Math.max(0.05, Math.min(0.95, rawFairYes));
   
   const fairYesPrice = Number(rawFairYes.toFixed(2));
   const fairNoPrice = Number((1 - fairYesPrice).toFixed(2));
 
-  // Calculate Instantaneous Spread Gap against Limitless Live Orderbook Quotes
+  // Calculate Spread Gap against Limitless Live Orderbook Quotes
   const yesSpreadGap = Number((fairYesPrice - currentYesPrice).toFixed(2));
   const noSpreadGap = Number((fairNoPrice - currentNoPrice).toFixed(2));
 
   // Arbitrage Opportunity Detection:
-  // Condition 1: Fair Price exceeds Market Price by at least minArbThreshold (e.g. +10%)
-  // Condition 2: Not in the extreme last 30 seconds of the window to avoid settlement race
+  // Condition 1: Fair Price exceeds Market Price by at least minArbThreshold (e.g. +12%)
+  // Condition 2: Market price must be in reasonable scalping range (0.15 - 0.75) to prevent buying at 90c or worthless 5c
+  // Condition 3: Not in the first 45 seconds (volatility settlement) or last 60 seconds of the window
+  // Condition 4: BTC must have moved at least $35 from strike to avoid 50/50 chop
   let activeOpportunity: "BUY_UP_ARB" | "BUY_DOWN_ARB" | "NEUTRAL" = "NEUTRAL";
   let arbEdgePct = 0;
   let estimatedNetProfitPct = 0;
 
-  const isWindowActive = secondsRemainingInWindow > 30 && secondsRemainingInWindow < 870;
+  const isWindowActive = secondsRemainingInWindow > 60 && secondsRemainingInWindow < 855;
+  const hasBtcMomentum = Math.abs(priceDeltaUsd) >= 30; // Minimum $30 confirmed move
 
-  if (isWindowActive) {
-    if (yesSpreadGap >= minArbThreshold && currentYesPrice <= 0.85) {
+  if (isWindowActive && hasBtcMomentum) {
+    if (yesSpreadGap >= minArbThreshold && currentYesPrice >= 0.15 && currentYesPrice <= 0.75 && priceDeltaUsd > 0) {
       activeOpportunity = "BUY_UP_ARB";
       arbEdgePct = Number(((yesSpreadGap / currentYesPrice) * 100).toFixed(1));
-      estimatedNetProfitPct = Number((((1.00 - currentYesPrice) / currentYesPrice) * 100).toFixed(1));
-    } else if (noSpreadGap >= minArbThreshold && currentNoPrice <= 0.85) {
+      estimatedNetProfitPct = Number((((fairYesPrice - currentYesPrice) / currentYesPrice) * 100).toFixed(1));
+    } else if (noSpreadGap >= minArbThreshold && currentNoPrice >= 0.15 && currentNoPrice <= 0.75 && priceDeltaUsd < 0) {
       activeOpportunity = "BUY_DOWN_ARB";
       arbEdgePct = Number(((noSpreadGap / currentNoPrice) * 100).toFixed(1));
-      estimatedNetProfitPct = Number((((1.00 - currentNoPrice) / currentNoPrice) * 100).toFixed(1));
+      estimatedNetProfitPct = Number((((fairNoPrice - currentNoPrice) / currentNoPrice) * 100).toFixed(1));
     }
   }
 
@@ -342,23 +362,30 @@ function evaluateLatencyArbitrage(currentBtcPrice: number) {
 
   // AUTOMATED LATENCY ARBITRAGE EXECUTION TRIGGER
   if (isBotRunning && isWindowActive && activeOpportunity !== "NEUTRAL") {
-    // Throttle: Don't execute more than once every 12 seconds per direction
-    if (Date.now() - lastArbExecutionTime > 12000) {
+    // Strict Execution Rules:
+    // Rule 1: Max 1 position per 15m window to prevent overtrading / balance draining
+    // Rule 2: Minimum 30 seconds cooldown between attempts
+    const canTradeInWindow = tradesInCurrentWindow < maxTradesPerWindow;
+    const cooldownElapsed = Date.now() - lastArbExecutionTime > 30000;
+
+    if (canTradeInWindow && cooldownElapsed) {
       lastArbExecutionTime = Date.now();
+      lastTradedWindowIndex = currentWindowIndex;
+      tradesInCurrentWindow++;
       
       const direction: "YES" | "NO" = activeOpportunity === "BUY_UP_ARB" ? "YES" : "NO";
       const targetMarketPrice = direction === "YES" ? currentYesPrice : currentNoPrice;
       const targetFairPrice = direction === "YES" ? fairYesPrice : fairNoPrice;
       const spread = direction === "YES" ? yesSpreadGap : noSpreadGap;
 
-      addLog("ALERT", `⚡ [LATENCY ARB OPPORTUNITY DETECTED] Direction: ${direction} | Fair: $${targetFairPrice.toFixed(2)} vs Market: $${targetMarketPrice.toFixed(2)} (Edge: +${(spread * 100).toFixed(0)}%) | BTC: $${currentBtcPrice.toFixed(2)} (Δ: $${priceDeltaUsd})`);
+      addLog("ALERT", `⚡ [ARBITRAGE OPPORTUNITY TRIGGERED] Direction: ${direction} | Fair: $${targetFairPrice.toFixed(2)} vs Market: $${targetMarketPrice.toFixed(2)} (Edge: +${(spread * 100).toFixed(0)}%) | BTC: $${currentBtcPrice.toFixed(2)} (Δ: $${priceDeltaUsd})`);
 
       executeLatencyArbTrade(direction, currentBtcPrice, strike, targetMarketPrice, targetFairPrice, spread, currentWindowIndex);
     }
   }
 }
 
-// Instant Execution Engine for Latency Arbitrage Orders
+// Order Execution Engine: Supports Strict Limit Maker & Scalping Take-Profit
 async function executeLatencyArbTrade(
   direction: "YES" | "NO",
   binancePrice: number,
@@ -369,7 +396,7 @@ async function executeLatencyArbTrade(
   windowIndex: number
 ) {
   const currentBalance = liveBalance;
-  // Dynamic Risk Allocation: configurable % of wallet balance per Latency Arb opportunity (default 5%)
+  // Dynamic Risk Allocation: % of wallet balance per opportunity (default 4%)
   let tradeAmount = currentBalance > 0 ? (currentBalance * riskPercentage) : 0;
   tradeAmount = Math.floor(tradeAmount * 100) / 100;
 
@@ -378,12 +405,20 @@ async function executeLatencyArbTrade(
   }
 
   if (tradeAmount <= 0) {
-    addLog("WARN", `Latency Arb trade (${direction}) skipped: live balance ($${currentBalance.toFixed(2)}) is insufficient.`);
+    addLog("WARN", `Trade (${direction}) skipped: live balance ($${currentBalance.toFixed(2)}) is insufficient.`);
     return;
   }
 
-  // Ensure reasonable execution price with slight slippage buffer
-  const executionPrice = Number((Math.min(marketPrice + 0.02, fairPrice - 0.02, 0.88)).toFixed(2));
+  // Execution Price Calculation based on selected executionMode:
+  // MAKER_LIMIT: Sets price at or slightly below market to ensure it sits in the book as a LIMIT order without crossing spread
+  // SNIPER: Sets limit price exactly at current ask or capped at fairPrice - 0.05
+  let executionPrice: number;
+  if (executionMode === "MAKER_LIMIT") {
+    executionPrice = Number(Math.max(0.15, Math.min(marketPrice, fairPrice - 0.05)).toFixed(2));
+  } else {
+    executionPrice = Number(Math.min(marketPrice, fairPrice - 0.03, 0.75).toFixed(2));
+  }
+
   const shares = Number((tradeAmount / executionPrice).toFixed(2));
   tradeAmount = Number((shares * executionPrice).toFixed(2));
 
@@ -399,10 +434,10 @@ async function executeLatencyArbTrade(
     amount: tradeAmount,
     shares,
     mode,
-    orderType: "FOK / GTC (ARB)",
+    orderType: executionMode === "MAKER_LIMIT" ? "LIMIT (MAKER)" : "GTC LIMIT",
     windowIndex,
     targetPayout: Number((shares * 1.00).toFixed(2)),
-    status: "PLACED (LATENCY ARB BUY)",
+    status: "PLACED (LIMIT BUY)",
     strategyType: "LATENCY_ARB",
     arbMetrics: {
       fairPrice,
@@ -420,7 +455,7 @@ async function executeLatencyArbTrade(
     tradeHistory.unshift(tradeDetails);
     if (tradeHistory.length > 50) tradeHistory.pop();
     broadcast("trade", tradeDetails);
-    addLog("ERROR", `LIVE Latency Arb order failed: ${reason}`);
+    addLog("ERROR", `LIVE order failed: ${reason}`);
     return;
   }
 
@@ -433,7 +468,7 @@ async function executeLatencyArbTrade(
     tradeDetails.tokenId = tokenId;
     tradeDetails.marketSlug = market.slug;
 
-    addLog("INFO", `🚀 [ORDER DISPATCH] Sending LIVE Latency Arb Buy for ${direction} @ $${executionPrice.toFixed(2)} (${shares} shares, Edge: +${(spreadGap * 100).toFixed(0)}%)...`);
+    addLog("INFO", `🚀 [ORDER SUBMIT] Dispatching ${tradeDetails.orderType} for ${direction} @ $${executionPrice.toFixed(2)} (${shares} shares)...`);
 
     const result: any = await orderQueue.enqueue(() =>
       withRetry(
@@ -464,17 +499,19 @@ async function executeLatencyArbTrade(
 
     if (result?.execution?.settlementStatus === "CANCELED" && result?.execution?.reason === "STP_TAKER_REJECTED") {
       tradeDetails.status = "REJECTED (STP)";
-      addLog("WARN", `⚠️ Latency Arb Order rejected by STP.`);
+      addLog("WARN", `⚠️ Order rejected by STP.`);
     } else if (isFilledImmediately) {
-      tradeDetails.status = `FILLED (ARB MATCHED in ${execSpeedMs}ms)`;
-      addLog("SUCCESS", `🎯 LIVE LATENCY ARB FILLED in ${execSpeedMs}ms! Direction: ${direction} [ID: ${orderId}] @ $${executionPrice.toFixed(2)} (${shares} shares). Value locked: $${tradeAmount.toFixed(2)}.`);
+      tradeDetails.status = `FILLED (MATCHED @ $${executionPrice.toFixed(2)})`;
+      addLog("SUCCESS", `🎯 FILLED in ${execSpeedMs}ms! ${direction} [ID: ${orderId}] @ $${executionPrice.toFixed(2)} (${shares} shares).`);
       
-      // Auto Take-Profit Limit Sell when quote converges to Fair Value (or +25% profit)
-      const tpTargetPrice = Number((Math.min(Math.max(fairPrice, executionPrice + 0.15), 0.95)).toFixed(2));
-      placeTakeProfitSell(market.slug, tokenId, shares, tradeDetails, tpTargetPrice);
+      // Dynamic Take-Profit: Place Limit Sell +15 cents above entry price (e.g. entry 0.40 -> sell 0.55)
+      const tpTargetPrice = Number((Math.min(executionPrice + tpTargetDelta, 0.88)).toFixed(2));
+      setTimeout(() => {
+        placeTakeProfitSell(market.slug, tokenId, shares, tradeDetails, tpTargetPrice);
+      }, 1200);
     } else {
-      tradeDetails.status = "OPEN (ARB LIMIT ORDER IN BOOK)";
-      addLog("SUCCESS", `⚡ LIVE ARB ORDER SUBMITTED in ${execSpeedMs}ms: Sitting in Limitless Orderbook [ID: ${orderId}] for ${direction} @ $${executionPrice.toFixed(2)}.`);
+      tradeDetails.status = "OPEN (LIMIT ORDER IN BOOK)";
+      addLog("SUCCESS", `⚡ LIMIT ORDER POSTED in ${execSpeedMs}ms: Sitting in Orderbook [ID: ${orderId}] for ${direction} @ $${executionPrice.toFixed(2)}.`);
     }
 
     tradeHistory.unshift(tradeDetails);
@@ -482,19 +519,20 @@ async function executeLatencyArbTrade(
     broadcast("trade", tradeDetails);
     setTimeout(updateLiveBalance, 1500);
   } catch (error: any) {
-    console.error("Error executing Latency Arb trade:", error);
+    console.error("Error executing trade:", error);
     const errMessage = error?.data?.message || error?.message || "Unknown error";
     tradeDetails.status = `ERROR (${errMessage})`;
     tradeHistory.unshift(tradeDetails);
     if (tradeHistory.length > 50) tradeHistory.pop();
     broadcast("trade", tradeDetails);
-    addLog("ERROR", `❌ LIVE LATENCY ARB FAILED: ${errMessage}`);
+    addLog("ERROR", `❌ ORDER FAILED: ${errMessage}`);
   }
 }
 
-async function placeTakeProfitSell(marketSlug: string, tokenId: string, shares: number, parentTrade: PositionTrade, tpPrice = 0.85) {
+async function placeTakeProfitSell(marketSlug: string, tokenId: string, shares: number, parentTrade: PositionTrade, tpPrice: number) {
   try {
-    addLog("INFO", `📈 Placing Statistical Convergence Take-Profit Limit Sell for ${parentTrade.direction} @ $${tpPrice.toFixed(2)} (${shares} shares)...`);
+    const profitPct = Number((((tpPrice - parentTrade.contractPrice) / parentTrade.contractPrice) * 100).toFixed(0));
+    addLog("INFO", `📈 Placing Take-Profit Limit Sell for ${parentTrade.direction} @ $${tpPrice.toFixed(2)} (+${profitPct}% profit target)...`);
     const sellResult: any = await orderQueue.enqueue(() =>
       withRetry(
         () => limitlessOrderClient!.createOrder({
@@ -515,11 +553,11 @@ async function placeTakeProfitSell(marketSlug: string, tokenId: string, shares: 
     const sellOrderId = sellResult?.order?.id || sellResult?.orderId || sellResult?.id || "N/A";
     parentTrade.tpOrderId = sellOrderId;
     parentTrade.status = `TP_ACTIVE (LIMIT SELL @ $${tpPrice.toFixed(2)})`;
-    addLog("SUCCESS", `🚀 TAKE-PROFIT ORDER LIVE: Limit Sell [ID: ${sellOrderId}] placed @ $${tpPrice.toFixed(2)}!`);
+    addLog("SUCCESS", `🚀 TAKE-PROFIT ORDER ACTIVE: Limit Sell [ID: ${sellOrderId}] @ $${tpPrice.toFixed(2)} (+${profitPct}%)!`);
     broadcast("trade", parentTrade);
   } catch (tpErr: any) {
-    console.warn("Error placing take-profit sell order:", tpErr?.message || tpErr);
-    addLog("WARN", `⚠️ Could not place instant TP Sell @ $${tpPrice.toFixed(2)}: ${tpErr.message}. Holding for settlement.`);
+    console.warn("Take-profit sell notice:", tpErr?.message || tpErr);
+    addLog("WARN", `⚠️ TP Sell placement pending execution (@ $${tpPrice.toFixed(2)}). Background monitor will manage closure.`);
   }
 }
 
@@ -891,7 +929,7 @@ async function initializeLimitlessClient() {
   }
 }
 
-// Background Monitor: Verifies order fills and manages Take-Profit
+// Background Monitor: Verifies order fills, manages Take-Profit, Stop-Loss, and Time-Decay exits
 let isMonitoringOrders = false;
 async function monitorOpenOrdersAndPositions() {
   if (isMonitoringOrders || !limitlessPortfolioFetcher || !isBotRunning) return;
@@ -901,18 +939,73 @@ async function monitorOpenOrdersAndPositions() {
     const clobPositions = await limitlessPortfolioFetcher.getCLOBPositions().catch(() => []);
 
     for (const trade of tradeHistory) {
-      if (trade.status.includes("OPEN") || trade.status.includes("PLACED")) {
+      if (trade.status.includes("OPEN") || trade.status.includes("PLACED") || trade.status.includes("FILLED") || trade.status.includes("TP_ACTIVE")) {
         const matchingPosition = clobPositions.find((p: any) => p.marketSlug === trade.marketSlug);
         const positionShares = matchingPosition ? 
           (trade.direction === "YES" ? Number(matchingPosition.positions?.yes?.shares || 0) : Number(matchingPosition.positions?.no?.shares || 0)) : 0;
 
-        if (positionShares > 0) {
-          trade.status = `FILLED (ARB POSITION ACTIVE)`;
-          addLog("SUCCESS", `🎯 [Arb Position Verified]: ${trade.direction} active with ${positionShares} shares!`);
+        const currentQuotePrice = trade.direction === "YES" ? currentYesPrice : currentNoPrice;
 
-          if (trade.marketSlug && trade.tokenId && !trade.tpOrderId) {
-            const tpTarget = Number((Math.min(trade.contractPrice + 0.20, 0.90)).toFixed(2));
-            await placeTakeProfitSell(trade.marketSlug, trade.tokenId, trade.shares, trade, tpTarget);
+        // Position detected as active on-chain
+        if (positionShares > 0 && !trade.tpOrderId && !trade.status.includes("TP_ACTIVE") && !trade.status.includes("CLOSED")) {
+          trade.status = `FILLED (ACTIVE: ${positionShares} SHARES)`;
+          addLog("SUCCESS", `🎯 [Active Position]: ${trade.direction} holding ${positionShares} shares @ $${trade.contractPrice.toFixed(2)}.`);
+
+          if (trade.marketSlug && trade.tokenId) {
+            const tpTarget = Number((Math.min(trade.contractPrice + tpTargetDelta, 0.88)).toFixed(2));
+            await placeTakeProfitSell(trade.marketSlug, trade.tokenId, positionShares, trade, tpTarget);
+          }
+        }
+
+        // Active Stop-Loss or Profit Target Execution
+        if (positionShares > 0 && trade.marketSlug && trade.tokenId) {
+          const pnlDelta = currentQuotePrice - trade.contractPrice;
+          
+          // Condition 1: Take Profit Hit in live market
+          if (pnlDelta >= tpTargetDelta && !trade.status.includes("PROFIT_TAKEN")) {
+            addLog("SUCCESS", `💰 [TAKE PROFIT TRIGGERED]: Quote reached $${currentQuotePrice.toFixed(2)} (+${(pnlDelta * 100).toFixed(0)}¢ profit). Executing fast close!`);
+            try {
+              await orderQueue.enqueue(() => limitlessOrderClient!.createOrder({
+                marketSlug: trade.marketSlug!,
+                tokenId: trade.tokenId!,
+                side: Side.SELL,
+                price: Number(Math.max(0.10, currentQuotePrice - 0.02).toFixed(2)),
+                size: positionShares,
+                orderType: OrderType.GTC,
+                ...( { stpPolicy: "cancel_maker" } as any ),
+              }));
+              trade.status = `PROFIT_TAKEN (+${(pnlDelta * 100).toFixed(0)}¢)`;
+              trade.pnl = Number((positionShares * currentQuotePrice - trade.amount).toFixed(2));
+              broadcast("trade", trade);
+              setTimeout(updateLiveBalance, 1500);
+            } catch (closeErr: any) {
+              console.warn("TP Market close notice:", closeErr?.message || closeErr);
+            }
+          }
+
+          // Condition 2: Stop Loss Hit
+          else if (pnlDelta <= -stopLossDelta && !trade.status.includes("STOPPED_OUT") && !trade.status.includes("CLOSED")) {
+            addLog("WARN", `🛡️ [STOP LOSS TRIGGERED]: Quote dropped to $${currentQuotePrice.toFixed(2)} (-${(Math.abs(pnlDelta) * 100).toFixed(0)}¢). Cutting loss to save capital!`);
+            try {
+              if (trade.tpOrderId) {
+                await limitlessOrderClient?.cancel(trade.tpOrderId).catch(() => {});
+              }
+              await orderQueue.enqueue(() => limitlessOrderClient!.createOrder({
+                marketSlug: trade.marketSlug!,
+                tokenId: trade.tokenId!,
+                side: Side.SELL,
+                price: Number(Math.max(0.05, currentQuotePrice - 0.02).toFixed(2)),
+                size: positionShares,
+                orderType: OrderType.GTC,
+                ...( { stpPolicy: "cancel_maker" } as any ),
+              }));
+              trade.status = `STOPPED_OUT (-${(Math.abs(pnlDelta) * 100).toFixed(0)}¢)`;
+              trade.pnl = Number((positionShares * currentQuotePrice - trade.amount).toFixed(2));
+              broadcast("trade", trade);
+              setTimeout(updateLiveBalance, 1500);
+            } catch (slErr: any) {
+              console.warn("Stop-loss close notice:", slErr?.message || slErr);
+            }
           }
         }
       }
@@ -979,6 +1072,10 @@ app.get("/api/state", (req, res) => {
     arbMetrics: latestArbMetrics,
     minArbThreshold,
     riskPercentage,
+    tpTargetDelta,
+    stopLossDelta,
+    executionMode,
+    maxTradesPerWindow,
     hasLiveKeys,
     rpcStatus,
     logs: systemLogs,
@@ -991,13 +1088,13 @@ app.post("/api/toggle", async (req, res) => {
   if (typeof running === "boolean") {
     isBotRunning = running;
     broadcast("bot_status", { isBotRunning });
-    addLog("INFO", `⚡ Latency Arbitrage & Cross-Exchange Arb Engine ${isBotRunning ? 'STARTED (LIVE)' : 'STOPPED'}`);
+    addLog("INFO", `⚡ Latency Arbitrage & Scalping Engine ${isBotRunning ? 'STARTED (LIVE)' : 'STOPPED'}`);
   }
   res.json({ success: true, isBotRunning });
 });
 
 app.post("/api/settings", async (req, res) => {
-  const { threshold, risk } = req.body;
+  const { threshold, risk, tpTarget, stopLoss, mode: execMode, maxTrades } = req.body;
   if (typeof threshold === "number" && threshold >= 0.03 && threshold <= 0.50) {
     minArbThreshold = threshold;
     addLog("INFO", `⚙️ Arbitrage Trigger Threshold updated to: ${(minArbThreshold * 100).toFixed(0)}%`);
@@ -1007,8 +1104,23 @@ app.post("/api/settings", async (req, res) => {
     riskPercentage = risk;
     addLog("INFO", `🛡️ Risk Allocation updated to: ${(riskPercentage * 100).toFixed(0)}% of wallet balance per trade.`);
   }
-  broadcast("settings_update", { minArbThreshold, riskPercentage });
-  res.json({ success: true, minArbThreshold, riskPercentage });
+  if (typeof tpTarget === "number" && tpTarget >= 0.05 && tpTarget <= 0.40) {
+    tpTargetDelta = tpTarget;
+    addLog("INFO", `🎯 Take-Profit Target updated to: +${(tpTargetDelta * 100).toFixed(0)}¢ above entry.`);
+  }
+  if (typeof stopLoss === "number" && stopLoss >= 0.05 && stopLoss <= 0.50) {
+    stopLossDelta = stopLoss;
+    addLog("INFO", `🛑 Stop-Loss Threshold updated to: -${(stopLossDelta * 100).toFixed(0)}¢ below entry.`);
+  }
+  if (execMode === "MAKER_LIMIT" || execMode === "SNIPER") {
+    executionMode = execMode;
+    addLog("INFO", `⚡ Execution Mode set to: ${executionMode === "MAKER_LIMIT" ? "Maker Limit (أمر محدد فقط)" : "Sniper (قناص سريع)"}`);
+  }
+  if (typeof maxTrades === "number" && maxTrades >= 1 && maxTrades <= 5) {
+    maxTradesPerWindow = maxTrades;
+  }
+  broadcast("settings_update", { minArbThreshold, riskPercentage, tpTargetDelta, stopLossDelta, executionMode, maxTradesPerWindow });
+  res.json({ success: true, minArbThreshold, riskPercentage, tpTargetDelta, stopLossDelta, executionMode, maxTradesPerWindow });
 });
 
 app.post("/api/cancel-orders", async (req, res) => {

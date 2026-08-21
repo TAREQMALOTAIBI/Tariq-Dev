@@ -98,6 +98,10 @@ interface AppState {
   arbMetrics: LatencyArbMetrics | null;
   minArbThreshold: number;
   riskPercentage?: number;
+  tpTargetDelta?: number;
+  stopLossDelta?: number;
+  executionMode?: "MAKER_LIMIT" | "SNIPER";
+  maxTradesPerWindow?: number;
   hasLiveKeys: boolean;
   rpcStatus?: {
     connected: boolean;
@@ -121,16 +125,24 @@ export default function App() {
     arbMetrics: null,
     minArbThreshold: 0.10,
     riskPercentage: 0.04,
+    tpTargetDelta: 0.15,
+    stopLossDelta: 0.20,
+    executionMode: "MAKER_LIMIT",
+    maxTradesPerWindow: 1,
     hasLiveKeys: false,
   });
 
   const [wsStatus, setWsStatus] = useState<'connected' | 'disconnected'>('disconnected');
   const [trades, setTrades] = useState<PositionTrade[]>([]);
   const [logs, setLogs] = useState<SystemLog[]>([]);
+  const [activeTab, setActiveTab] = useState<'logs' | 'trades'>('logs');
   const [togglingBot, setTogglingBot] = useState(false);
   const [cancellingOrders, setCancellingOrders] = useState(false);
   const [selectedThreshold, setSelectedThreshold] = useState<number>(0.10);
   const [selectedRisk, setSelectedRisk] = useState<number>(0.04);
+  const [selectedTpTarget, setSelectedTpTarget] = useState<number>(0.15);
+  const [selectedStopLoss, setSelectedStopLoss] = useState<number>(0.20);
+  const [selectedExecMode, setSelectedExecMode] = useState<"MAKER_LIMIT" | "SNIPER">("MAKER_LIMIT");
 
   const handleCancelAllOrders = async () => {
     setCancellingOrders(true);
@@ -146,30 +158,50 @@ export default function App() {
     }
   };
 
-  const handleUpdateThreshold = async (threshold: number) => {
-    setSelectedThreshold(threshold);
+  const updateSettings = async (overrides: any) => {
     try {
+      const payload = {
+        threshold: selectedThreshold,
+        risk: selectedRisk,
+        tpTarget: selectedTpTarget,
+        stopLoss: selectedStopLoss,
+        mode: selectedExecMode,
+        maxTrades: 1,
+        ...overrides,
+      };
       await fetch('/api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ threshold, risk: selectedRisk }),
+        body: JSON.stringify(payload),
       });
     } catch (err) {
-      console.error('خطأ في تحديث حد المراجحة:', err);
+      console.error('خطأ في تحديث الإعدادات:', err);
     }
+  };
+
+  const handleUpdateThreshold = async (threshold: number) => {
+    setSelectedThreshold(threshold);
+    await updateSettings({ threshold });
   };
 
   const handleUpdateRisk = async (risk: number) => {
     setSelectedRisk(risk);
-    try {
-      await fetch('/api/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ risk, threshold: selectedThreshold }),
-      });
-    } catch (err) {
-      console.error('خطأ في تحديث نسبة المخاطرة:', err);
-    }
+    await updateSettings({ risk });
+  };
+
+  const handleUpdateTp = async (tpTarget: number) => {
+    setSelectedTpTarget(tpTarget);
+    await updateSettings({ tpTarget });
+  };
+
+  const handleUpdateSl = async (stopLoss: number) => {
+    setSelectedStopLoss(stopLoss);
+    await updateSettings({ stopLoss });
+  };
+
+  const handleUpdateExecMode = async (mode: "MAKER_LIMIT" | "SNIPER") => {
+    setSelectedExecMode(mode);
+    await updateSettings({ mode });
   };
 
   const fetchState = async () => {
@@ -183,6 +215,9 @@ export default function App() {
         }));
         if (data.minArbThreshold) setSelectedThreshold(data.minArbThreshold);
         if (data.riskPercentage) setSelectedRisk(data.riskPercentage);
+        if (data.tpTargetDelta) setSelectedTpTarget(data.tpTargetDelta);
+        if (data.stopLossDelta) setSelectedStopLoss(data.stopLossDelta);
+        if (data.executionMode) setSelectedExecMode(data.executionMode);
         if (data.logs) setLogs(data.logs);
         if (data.trades) setTrades(data.trades);
       }
@@ -290,6 +325,9 @@ export default function App() {
         const data = JSON.parse(e.data);
         if (data.minArbThreshold !== undefined) setSelectedThreshold(data.minArbThreshold);
         if (data.riskPercentage !== undefined) setSelectedRisk(data.riskPercentage);
+        if (data.tpTargetDelta !== undefined) setSelectedTpTarget(data.tpTargetDelta);
+        if (data.stopLossDelta !== undefined) setSelectedStopLoss(data.stopLossDelta);
+        if (data.executionMode) setSelectedExecMode(data.executionMode);
       } catch (err) {
         console.error('خطأ في تحليل حدث تحديث الإعدادات:', err);
       }
@@ -690,78 +728,126 @@ export default function App() {
           </div>
         </div>
 
-        {/* Engine Settings & Emergency Management */}
+        {/* Engine Settings & Control Center */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-          {/* 1. Arbitrage Sensitivity Config */}
+          {/* 1. Execution Mode & Order Type */}
           <div className="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-5 flex flex-col justify-between">
             <div>
               <div className="flex items-center space-x-2 space-x-reverse mb-3">
                 <Sliders className="w-4 h-4 text-cyan-400" />
-                <h2 className="text-xs font-bold text-slate-200">حساسية فجوة المراجحة (Edge)</h2>
+                <h2 className="text-xs font-bold text-slate-200">وضع التنفيذ (Execution Mode)</h2>
               </div>
               <p className="text-[11px] text-slate-400 leading-relaxed mb-3">
-                الحد الأدنى لفارق السعر النظري لتنفيذ الشراء:
+                التحكم في طريقة إرسال الأوامر للمنصة:
               </p>
 
-              <div className="grid grid-cols-4 gap-1.5">
-                {[0.05, 0.08, 0.10, 0.15].map((thresh) => (
-                  <button
-                    key={thresh}
-                    onClick={() => handleUpdateThreshold(thresh)}
-                    className={`py-1.5 px-2 rounded-xl text-xs font-bold font-mono transition-all cursor-pointer ${
-                      selectedThreshold === thresh
-                        ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20'
-                        : 'bg-slate-950 border border-slate-800 text-slate-300 hover:border-slate-700'
-                    }`}
-                  >
-                    +{(thresh * 100).toFixed(0)}%
-                  </button>
-                ))}
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => handleUpdateExecMode("MAKER_LIMIT")}
+                  className={`py-2 px-2 rounded-xl text-xs font-bold font-mono transition-all cursor-pointer flex flex-col items-center ${
+                    selectedExecMode === "MAKER_LIMIT"
+                      ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20 ring-1 ring-cyan-300'
+                      : 'bg-slate-950 border border-slate-800 text-slate-300 hover:border-slate-700'
+                  }`}
+                >
+                  <span>Maker Limit</span>
+                  <span className="text-[9px] opacity-80">أمر محدد (0 انزلاق)</span>
+                </button>
+                <button
+                  onClick={() => handleUpdateExecMode("SNIPER")}
+                  className={`py-2 px-2 rounded-xl text-xs font-bold font-mono transition-all cursor-pointer flex flex-col items-center ${
+                    selectedExecMode === "SNIPER"
+                      ? 'bg-purple-500 text-white shadow-md shadow-purple-500/20 ring-1 ring-purple-300'
+                      : 'bg-slate-950 border border-slate-800 text-slate-300 hover:border-slate-700'
+                  }`}
+                >
+                  <span>Sniper</span>
+                  <span className="text-[9px] opacity-80">تنفيذ فوري</span>
+                </button>
               </div>
             </div>
 
-            <div className="mt-3 pt-2.5 border-t border-slate-800/80 text-[11px] text-slate-500">
-              الحد المختار: <span className="text-cyan-400 font-bold">+{(selectedThreshold * 100).toFixed(0)}%</span>.
-            </div>
-          </div>
-
-          {/* 2. Risk Allocation & Position Sizing */}
-          <div className="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-5 flex flex-col justify-between">
-            <div>
-              <div className="flex items-center space-x-2 space-x-reverse mb-3">
-                <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                <h2 className="text-xs font-bold text-slate-200">حجم المخاطرة في الصفقة (Risk Size)</h2>
-              </div>
-              <p className="text-[11px] text-slate-400 leading-relaxed mb-3">
-                نسبة الرصيد المخصصة لكل فرصة مراجحة سريعة:
-              </p>
-
-              <div className="grid grid-cols-5 gap-1">
-                {[0.02, 0.03, 0.04, 0.05, 0.08].map((risk) => (
-                  <button
-                    key={risk}
-                    onClick={() => handleUpdateRisk(risk)}
-                    className={`py-1.5 px-1.5 rounded-xl text-xs font-bold font-mono transition-all cursor-pointer ${
-                      selectedRisk === risk
-                        ? 'bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/20 ring-1 ring-emerald-300'
-                        : 'bg-slate-950 border border-slate-800 text-slate-300 hover:border-slate-700'
-                    }`}
-                  >
-                    {(risk * 100).toFixed(0)}%
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="mt-3 pt-2.5 border-t border-slate-800/80 text-[11px] text-slate-400 flex justify-between items-center">
-              <span>حجم العقد المقدر:</span>
-              <span className="text-emerald-400 font-mono font-bold">
-                ${(state.liveBalance * selectedRisk).toFixed(2)} USD ({(selectedRisk * 100).toFixed(0)}%)
+            <div className="mt-3 pt-2.5 border-t border-slate-800/80 text-[11px] text-slate-500 flex justify-between">
+              <span>الوضع الحالي:</span>
+              <span className="text-cyan-400 font-bold">
+                {selectedExecMode === "MAKER_LIMIT" ? "صانع سوق محدد (GTC Maker)" : "قناص فوري"}
               </span>
             </div>
           </div>
 
-          {/* 3. Quick Actions & Collateral Management */}
+          {/* 2. Dynamic Take-Profit Target */}
+          <div className="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-5 flex flex-col justify-between">
+            <div>
+              <div className="flex items-center space-x-2 space-x-reverse mb-3">
+                <ArrowUpRight className="w-4 h-4 text-emerald-400" />
+                <h2 className="text-xs font-bold text-slate-200">حد أخذ الربح (Take-Profit)</h2>
+              </div>
+              <p className="text-[11px] text-slate-400 leading-relaxed mb-3">
+                فارق الربح فوق سعر الدخول لبيع العقد تلقائياً:
+              </p>
+
+              <div className="grid grid-cols-4 gap-1.5">
+                {[0.10, 0.15, 0.20, 0.25].map((tp) => (
+                  <button
+                    key={tp}
+                    onClick={() => handleUpdateTp(tp)}
+                    className={`py-1.5 px-2 rounded-xl text-xs font-bold font-mono transition-all cursor-pointer ${
+                      selectedTpTarget === tp
+                        ? 'bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/20 ring-1 ring-emerald-300'
+                        : 'bg-slate-950 border border-slate-800 text-slate-300 hover:border-slate-700'
+                    }`}
+                  >
+                    +{(tp * 100).toFixed(0)}¢
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="mt-3 pt-2.5 border-t border-slate-800/80 text-[11px] text-slate-400 flex justify-between">
+              <span>الهدف المختار:</span>
+              <span className="text-emerald-400 font-mono font-bold">
+                +{(selectedTpTarget * 100).toFixed(0)} سنت (+{((selectedTpTarget / 0.50) * 100).toFixed(0)}% عائد)
+              </span>
+            </div>
+          </div>
+
+          {/* 3. Dynamic Stop-Loss Protection */}
+          <div className="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-5 flex flex-col justify-between">
+            <div>
+              <div className="flex items-center space-x-2 space-x-reverse mb-3">
+                <ShieldCheck className="w-4 h-4 text-rose-400" />
+                <h2 className="text-xs font-bold text-slate-200">وقف الخسارة (Stop-Loss)</h2>
+              </div>
+              <p className="text-[11px] text-slate-400 leading-relaxed mb-3">
+                الخروج التلقائي لحماية رأس المال إذا انعكس الاتجاه:
+              </p>
+
+              <div className="grid grid-cols-3 gap-1.5">
+                {[0.15, 0.20, 0.30].map((sl) => (
+                  <button
+                    key={sl}
+                    onClick={() => handleUpdateSl(sl)}
+                    className={`py-1.5 px-2 rounded-xl text-xs font-bold font-mono transition-all cursor-pointer ${
+                      selectedStopLoss === sl
+                        ? 'bg-rose-500 text-white shadow-md shadow-rose-500/20 ring-1 ring-rose-300'
+                        : 'bg-slate-950 border border-slate-800 text-slate-300 hover:border-slate-700'
+                    }`}
+                  >
+                    -{(sl * 100).toFixed(0)}¢
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="mt-3 pt-2.5 border-t border-slate-800/80 text-[11px] text-slate-400 flex justify-between">
+              <span>حماية رأس المال:</span>
+              <span className="text-rose-400 font-mono font-bold">
+                -{(selectedStopLoss * 100).toFixed(0)} سنت (إيقاف تلقائي)
+              </span>
+            </div>
+          </div>
+
+          {/* 4. Quick Actions & Emergency Order Cleanup */}
           <div className="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-5 flex flex-col justify-between">
             <div>
               <div className="flex items-center space-x-2 space-x-reverse mb-3">
@@ -783,97 +869,139 @@ export default function App() {
             </div>
 
             <div className="mt-3 pt-2.5 border-t border-slate-800/80 text-[11px] text-slate-500 flex justify-between">
-              <span>العقد النشط:</span>
-              <span className="font-mono text-slate-300 truncate max-w-[120px]" title={state.contractSlug || ''}>
-                {state.contractSlug || 'btc-15m'}
-              </span>
-            </div>
-          </div>
-
-          {/* 4. Security & Credentials Status */}
-          <div className="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-5 flex flex-col justify-between">
-            <div>
-              <div className="flex items-center space-x-2 space-x-reverse mb-3">
-                <ShieldCheck className="w-4 h-4 text-cyan-400" />
-                <h2 className="text-xs font-bold text-slate-200">حالة الربط والبيئة</h2>
-              </div>
-
-              <div className="p-2 bg-emerald-950/40 border border-emerald-800/60 rounded-xl flex items-center justify-between mb-2">
-                <div className="flex items-center space-x-2 space-x-reverse">
-                  <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                  <span className="text-[11px] font-bold text-emerald-300">LIVE ONLY</span>
-                </div>
-                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-900/60 text-emerald-200 border border-emerald-700/50">
-                  Base Mainnet
-                </span>
-              </div>
-
-              <div className="p-2 rounded-xl bg-slate-950/60 border border-slate-800/60 text-xs flex items-center justify-between">
-                <span className="text-slate-400 text-[11px]">مفاتيح API والتوقيع:</span>
-                {state.hasLiveKeys ? (
-                  <span className="text-emerald-400 text-[11px] font-bold flex items-center gap-1">
-                    <ShieldCheck className="w-3 h-3" />
-                    مفعلة
-                  </span>
-                ) : (
-                  <span className="text-amber-400 text-[11px] font-bold flex items-center gap-1">
-                    <AlertTriangle className="w-3 h-3" />
-                    غير مكتملة
-                  </span>
-                )}
-              </div>
-            </div>
-
-            <div className="mt-3 pt-2.5 border-t border-slate-800/80 text-[11px] text-slate-500 flex justify-between">
-              <span>حالة المحرك:</span>
-              <span className={state.isBotRunning ? 'text-emerald-400 font-bold' : 'text-slate-400 font-bold'}>
-                {state.isBotRunning ? '● نشط ومراقب' : '○ متوقف'}
-              </span>
+              <span>قاعدة النافذة:</span>
+              <span className="text-cyan-400 font-bold">1 صفقة / نافذة 15 دقيقة</span>
             </div>
           </div>
         </div>
 
-        {/* Live Arbitrage Execution Logs & Trades Stream */}
+        {/* Live Arbitrage Execution Logs & Positions Stream with Tabs */}
         <div className="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-6">
           <div className="flex items-center justify-between mb-4 border-b border-slate-800 pb-3">
             <div className="flex items-center space-x-2 space-x-reverse">
-              <div className="flex items-center space-x-2 space-x-reverse px-4 py-2 rounded-xl text-xs font-semibold bg-slate-800 text-cyan-400 border border-slate-700">
+              <button
+                onClick={() => setActiveTab('logs')}
+                className={`flex items-center space-x-2 space-x-reverse px-4 py-2 rounded-xl text-xs font-semibold cursor-pointer transition-all ${
+                  activeTab === 'logs'
+                    ? 'bg-slate-800 text-cyan-400 border border-slate-700'
+                    : 'bg-transparent text-slate-400 hover:text-slate-200'
+                }`}
+              >
                 <Terminal className="w-4 h-4" />
-                <span>سجلات المراجحة والتنفيذ الفوري المباشرة ({logs.length})</span>
-              </div>
+                <span>سجلات المحرك المباشرة ({logs.length})</span>
+              </button>
+
+              <button
+                onClick={() => setActiveTab('trades')}
+                className={`flex items-center space-x-2 space-x-reverse px-4 py-2 rounded-xl text-xs font-semibold cursor-pointer transition-all ${
+                  activeTab === 'trades'
+                    ? 'bg-slate-800 text-emerald-400 border border-slate-700'
+                    : 'bg-transparent text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Activity className="w-4 h-4" />
+                <span>الصفقات والمراكز النشطة ({trades.length})</span>
+              </button>
             </div>
-            <span className="text-xs text-slate-500 font-mono">Sub-millisecond Streaming</span>
+            <span className="text-xs text-slate-500 font-mono">Sub-millisecond Engine Stream</span>
           </div>
 
-          <div className="bg-slate-950 rounded-xl p-4 border border-slate-800 font-mono text-xs space-y-2 h-80 overflow-y-auto">
-            {logs.length > 0 ? (
-              logs.map((log, idx) => (
-                <div key={idx} className="flex items-start space-x-3 space-x-reverse text-slate-300 py-1 border-b border-slate-900/80">
-                  <span className="text-slate-500 shrink-0">{new Date(log.time).toLocaleTimeString()}</span>
-                  <span
-                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0 ${
-                      log.type === 'ALERT'
-                        ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
-                        : log.type === 'SUCCESS'
-                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-                        : log.type === 'WARN'
-                        ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
-                        : log.type === 'ERROR'
-                        ? 'bg-red-500/20 text-red-400 border border-red-500/40'
-                        : 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20'
-                    }`}
-                  >
-                    {log.type}
-                  </span>
-                  <span className="leading-relaxed">{log.message}</span>
+          {activeTab === 'logs' ? (
+            <div className="bg-slate-950 rounded-xl p-4 border border-slate-800 font-mono text-xs space-y-2 h-80 overflow-y-auto">
+              {logs.length > 0 ? (
+                logs.map((log, idx) => (
+                  <div key={idx} className="flex items-start space-x-3 space-x-reverse text-slate-300 py-1 border-b border-slate-900/80">
+                    <span className="text-slate-500 shrink-0">{new Date(log.time).toLocaleTimeString()}</span>
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0 ${
+                        log.type === 'ALERT'
+                          ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                          : log.type === 'SUCCESS'
+                          ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                          : log.type === 'WARN'
+                          ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                          : log.type === 'ERROR'
+                          ? 'bg-red-500/20 text-red-400 border border-red-500/40'
+                          : 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20'
+                      }`}
+                    >
+                      {log.type}
+                    </span>
+                    <span className="leading-relaxed">{log.message}</span>
+                  </div>
+                ))
+              ) : (
+                <div className="h-full flex items-center justify-center text-slate-600">
+                  جاري الاستماع لسجلات المراجحة الفورية...
                 </div>
-              ))
-            ) : (
-              <div className="h-full flex items-center justify-center text-slate-600">
-                جاري الاستماع لسجلات المراجحة الفورية...
-              </div>
-            )}
-          </div>
+              )}
+            </div>
+          ) : (
+            <div className="bg-slate-950 rounded-xl p-4 border border-slate-800 font-mono text-xs space-y-3 h-80 overflow-y-auto">
+              {trades.length > 0 ? (
+                trades.map((trade) => (
+                  <div
+                    key={trade.id}
+                    className="p-3 rounded-xl bg-slate-900/70 border border-slate-800/80 flex flex-col md:flex-row md:items-center justify-between gap-3"
+                  >
+                    <div className="flex items-center space-x-3 space-x-reverse">
+                      <span
+                        className={`px-2.5 py-1 rounded-lg text-xs font-bold ${
+                          trade.direction === 'YES'
+                            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                            : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                        }`}
+                      >
+                        {trade.direction === 'YES' ? '🔼 UP (YES)' : '🔽 DOWN (NO)'}
+                      </span>
+                      <div className="flex flex-col">
+                        <span className="text-slate-200 font-bold">
+                          {trade.shares} عقد @ ${trade.contractPrice.toFixed(2)} (${trade.amount.toFixed(2)} USD)
+                        </span>
+                        <span className="text-[11px] text-slate-400">
+                          {new Date(trade.timestamp).toLocaleTimeString()} • {trade.marketSlug || '15m-BTC'}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center space-x-3 space-x-reverse">
+                      {trade.tpOrderId && (
+                        <span className="px-2 py-1 rounded bg-purple-950/80 text-purple-300 border border-purple-800/60 text-[10px] font-bold">
+                          🎯 هدف الربح مفعل
+                        </span>
+                      )}
+                      <span
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-bold ${
+                          trade.status.includes('PROFIT') || trade.status.includes('SUCCESS')
+                            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                            : trade.status.includes('STOPPED') || trade.status.includes('FAIL')
+                            ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                            : trade.status.includes('CANCELLED')
+                            ? 'bg-slate-800 text-slate-400'
+                            : 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 animate-pulse'
+                        }`}
+                      >
+                        {trade.status}
+                      </span>
+                      {trade.pnl !== undefined && (
+                        <span
+                          className={`font-bold font-mono text-xs ${
+                            trade.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                          }`}
+                        >
+                          {trade.pnl >= 0 ? `+$${trade.pnl.toFixed(2)}` : `-$${Math.abs(trade.pnl).toFixed(2)}`}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div className="h-full flex items-center justify-center text-slate-600">
+                  لا توجد صفقات مسجلة حتى الآن. عند تفعيل الروبوت واكتشاف فرصة مراجحة مؤكدة، ستظهر الصفقات هنا تلقائياً.
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </main>
     </div>
