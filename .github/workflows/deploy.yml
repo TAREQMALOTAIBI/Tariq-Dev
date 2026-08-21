@@ -1,71 +1,26 @@
-name: Deploy to GCP VM
+name: Auto Deploy to VM
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Deploy via SSH
+      - name: SSH and Deploy to VM
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USERNAME }}
           key: ${{ secrets.VM_SSH_KEY }}
-          port: 22
           script: |
-            export NVM_DIR="$HOME/.nvm"
-            if [ -s "$NVM_DIR/nvm.sh" ]; then
-              . "$NVM_DIR/nvm.sh"
-            fi
-
-            # Ensure Node, NPM, and PM2 are in PATH even in non-interactive SSH
-            LATEST_NODE=$(ls $HOME/.nvm/versions/node 2>/dev/null | tail -n 1)
-            if [ -n "$LATEST_NODE" ]; then
-              export PATH="$HOME/.nvm/versions/node/$LATEST_NODE/bin:$PATH"
-            fi
-            export PATH="$PATH:$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
-
-            echo "==> Checking Environment:"
-            echo "Node: $(node -v 2>/dev/null || echo 'Not found')"
-            echo "NPM: $(npm -v 2>/dev/null || echo 'Not found')"
-            echo "PM2: $(which pm2 2>/dev/null || echo 'Not found')"
-
-            # Prevent Git dubious ownership errors
-            git config --global --add safe.directory '*' || true
-
-            # Navigate to target repository directory
-            if [ -d "$HOME/Tariq-Dev" ]; then
-              cd "$HOME/Tariq-Dev"
-            elif [ -d "$HOME/Tariq-Dev-1" ]; then
-              cd "$HOME/Tariq-Dev-1"
-            else
-              echo "Error: Directory not found on VM!"
-              exit 1
-            fi
-
-            echo "==> Updating code from Git..."
-            git fetch origin ${{ github.ref_name }}
-            git reset --hard origin/${{ github.ref_name }}
-
-            echo "==> Installing npm packages..."
+            export PATH=$PATH:/usr/local/bin:/usr/bin:~/.nvm/versions/node/$(ls ~/.nvm/versions/node 2>/dev/null | tail -n 1)/bin
+            cd ~/Tariq-Dev
+            git fetch --all
+            git reset --hard origin/main
             npm install
-
-            echo "==> Building app..."
             npm run build
-
-            echo "==> Managing PM2 process..."
-            if command -v pm2 >/dev/null 2>&1; then
-              pm2 restart tariq-app --update-env || pm2 start dist/server.cjs --name "tariq-app"
-              pm2 save
-            else
-              echo "Error: PM2 command not found!"
-              exit 1
-            fi
-
-            echo "==> Deployment completed successfully!"
+            pm2 restart all --update-env || pm2 start dist/server.cjs --name "tariq-app"
+            pm2 save

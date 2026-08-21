@@ -1039,8 +1039,8 @@ app.get("/api/stream", (req, res) => {
 // Fetch initial historical candles
 async function fetchHistoricalData() {
   const restEndpoints = [
-    "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=100",
     "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=100",
+    "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=100",
     "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=100"
   ];
 
@@ -1083,12 +1083,13 @@ async function fetchHistoricalData() {
 }
 
 // Binance WebSocket Connection with multi-stream subscription (trade & kline for sub-millisecond price updates)
+// Uses Binance Vision public data-stream (global CDN designed for cloud instances without US geo-ip blocks)
 let binanceWs: WebSocket;
 const wsEndpoints = [
-  "wss://stream.binance.com:9443/ws/btcusdt@trade/btcusdt@kline_1m",
   "wss://data-stream.binance.vision/ws/btcusdt@trade/btcusdt@kline_1m",
+  "wss://data-stream.binance.vision:9443/ws/btcusdt@trade/btcusdt@kline_1m",
   "wss://stream.binance.us:9443/ws/btcusdt@trade/btcusdt@kline_1m",
-  "wss://data-stream.binance.vision:9443/ws/btcusdt@trade/btcusdt@kline_1m"
+  "wss://stream.binance.com:9443/ws/btcusdt@trade/btcusdt@kline_1m"
 ];
 let currentEndpointIndex = 0;
 
