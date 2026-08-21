@@ -502,13 +502,7 @@ async function executeLatencyArbTrade(
       addLog("WARN", `⚠️ Order rejected by STP.`);
     } else if (isFilledImmediately) {
       tradeDetails.status = `FILLED (MATCHED @ $${executionPrice.toFixed(2)})`;
-      addLog("SUCCESS", `🎯 FILLED in ${execSpeedMs}ms! ${direction} [ID: ${orderId}] @ $${executionPrice.toFixed(2)} (${shares} shares).`);
-      
-      // Dynamic Take-Profit: Place Limit Sell +15 cents above entry price (e.g. entry 0.40 -> sell 0.55)
-      const tpTargetPrice = Number((Math.min(executionPrice + tpTargetDelta, 0.88)).toFixed(2));
-      setTimeout(() => {
-        placeTakeProfitSell(market.slug, tokenId, shares, tradeDetails, tpTargetPrice);
-      }, 1200);
+      addLog("SUCCESS", `🎯 FILLED in ${execSpeedMs}ms! ${direction} [ID: ${orderId}] @ $${executionPrice.toFixed(2)} (${shares} shares). Holding for 100% win settlement.`);
     } else {
       tradeDetails.status = "OPEN (LIMIT ORDER IN BOOK)";
       addLog("SUCCESS", `⚡ LIMIT ORDER POSTED in ${execSpeedMs}ms: Sitting in Orderbook [ID: ${orderId}] for ${direction} @ $${executionPrice.toFixed(2)}.`);
@@ -947,44 +941,17 @@ async function monitorOpenOrdersAndPositions() {
         const currentQuotePrice = trade.direction === "YES" ? currentYesPrice : currentNoPrice;
 
         // Position detected as active on-chain
-        if (positionShares > 0 && !trade.tpOrderId && !trade.status.includes("TP_ACTIVE") && !trade.status.includes("CLOSED")) {
+        if (positionShares > 0 && !trade.status.includes("ACTIVE") && !trade.status.includes("CLOSED")) {
           trade.status = `FILLED (ACTIVE: ${positionShares} SHARES)`;
-          addLog("SUCCESS", `🎯 [Active Position]: ${trade.direction} holding ${positionShares} shares @ $${trade.contractPrice.toFixed(2)}.`);
-
-          if (trade.marketSlug && trade.tokenId) {
-            const tpTarget = Number((Math.min(trade.contractPrice + tpTargetDelta, 0.88)).toFixed(2));
-            await placeTakeProfitSell(trade.marketSlug, trade.tokenId, positionShares, trade, tpTarget);
-          }
+          addLog("SUCCESS", `🎯 [Active Position]: ${trade.direction} holding ${positionShares} shares @ $${trade.contractPrice.toFixed(2)} until settlement.`);
         }
 
-        // Active Stop-Loss or Profit Target Execution
+        // Active Position Management
         if (positionShares > 0 && trade.marketSlug && trade.tokenId) {
           const pnlDelta = currentQuotePrice - trade.contractPrice;
           
-          // Condition 1: Take Profit Hit in live market
-          if (pnlDelta >= tpTargetDelta && !trade.status.includes("PROFIT_TAKEN")) {
-            addLog("SUCCESS", `💰 [TAKE PROFIT TRIGGERED]: Quote reached $${currentQuotePrice.toFixed(2)} (+${(pnlDelta * 100).toFixed(0)}¢ profit). Executing fast close!`);
-            try {
-              await orderQueue.enqueue(() => limitlessOrderClient!.createOrder({
-                marketSlug: trade.marketSlug!,
-                tokenId: trade.tokenId!,
-                side: Side.SELL,
-                price: Number(Math.max(0.10, currentQuotePrice - 0.02).toFixed(2)),
-                size: positionShares,
-                orderType: OrderType.GTC,
-                ...( { stpPolicy: "cancel_maker" } as any ),
-              }));
-              trade.status = `PROFIT_TAKEN (+${(pnlDelta * 100).toFixed(0)}¢)`;
-              trade.pnl = Number((positionShares * currentQuotePrice - trade.amount).toFixed(2));
-              broadcast("trade", trade);
-              setTimeout(updateLiveBalance, 1500);
-            } catch (closeErr: any) {
-              console.warn("TP Market close notice:", closeErr?.message || closeErr);
-            }
-          }
-
-          // Condition 2: Stop Loss Hit
-          else if (pnlDelta <= -stopLossDelta && !trade.status.includes("STOPPED_OUT") && !trade.status.includes("CLOSED")) {
+          // Stop Loss Hit if price collapses
+          if (pnlDelta <= -stopLossDelta && !trade.status.includes("STOPPED_OUT") && !trade.status.includes("CLOSED")) {
             addLog("WARN", `🛡️ [STOP LOSS TRIGGERED]: Quote dropped to $${currentQuotePrice.toFixed(2)} (-${(Math.abs(pnlDelta) * 100).toFixed(0)}¢). Cutting loss to save capital!`);
             try {
               if (trade.tpOrderId) {

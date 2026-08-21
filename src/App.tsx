@@ -775,38 +775,38 @@ export default function App() {
             </div>
           </div>
 
-          {/* 2. Dynamic Take-Profit Target */}
+          {/* 2. Arbitrage Edge Threshold */}
           <div className="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-5 flex flex-col justify-between">
             <div>
               <div className="flex items-center space-x-2 space-x-reverse mb-3">
                 <ArrowUpRight className="w-4 h-4 text-emerald-400" />
-                <h2 className="text-xs font-bold text-slate-200">حد أخذ الربح (Take-Profit)</h2>
+                <h2 className="text-xs font-bold text-slate-200">فارق السعر المطلوب (Arb Edge)</h2>
               </div>
               <p className="text-[11px] text-slate-400 leading-relaxed mb-3">
-                فارق الربح فوق سعر الدخول لبيع العقد تلقائياً:
+                الحد الأدنى لفارق السعر النظري للشراء والاحتفاظ للتسوية ($1.00):
               </p>
 
               <div className="grid grid-cols-4 gap-1.5">
-                {[0.10, 0.15, 0.20, 0.25].map((tp) => (
+                {[0.08, 0.10, 0.12, 0.15].map((thresh) => (
                   <button
-                    key={tp}
-                    onClick={() => handleUpdateTp(tp)}
+                    key={thresh}
+                    onClick={() => handleUpdateThreshold(thresh)}
                     className={`py-1.5 px-2 rounded-xl text-xs font-bold font-mono transition-all cursor-pointer ${
-                      selectedTpTarget === tp
+                      selectedThreshold === thresh
                         ? 'bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/20 ring-1 ring-emerald-300'
                         : 'bg-slate-950 border border-slate-800 text-slate-300 hover:border-slate-700'
                     }`}
                   >
-                    +{(tp * 100).toFixed(0)}¢
+                    +{(thresh * 100).toFixed(0)}%
                   </button>
                 ))}
               </div>
             </div>
 
             <div className="mt-3 pt-2.5 border-t border-slate-800/80 text-[11px] text-slate-400 flex justify-between">
-              <span>الهدف المختار:</span>
+              <span>هدف الربح:</span>
               <span className="text-emerald-400 font-mono font-bold">
-                +{(selectedTpTarget * 100).toFixed(0)} سنت (+{((selectedTpTarget / 0.50) * 100).toFixed(0)}% عائد)
+                تسوية كاملة ($1.00 / عقد) بدون بيع مبكر
               </span>
             </div>
           </div>
