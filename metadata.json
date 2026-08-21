@@ -1,0 +1,6 @@
+{
+  "name": "BTC 15m Latency & Cross-Exchange Arbitrage Bot",
+  "description": "High-frequency Latency Arbitrage and Cross-Exchange Statistical Arbitrage engine comparing Binance real-time feeds with Limitless 15m BTC binary contracts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
