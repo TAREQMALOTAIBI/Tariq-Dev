@@ -237,23 +237,26 @@ export default function App() {
     try {
       const res = await fetch('/api/state');
       if (res.ok) {
-        const data = await res.json();
-        setState((prev) => ({
-          ...prev,
-          ...data,
-        }));
-        if (data.activeStrategy) setSelectedStrategy(data.activeStrategy);
-        if (data.snipeConfidence) setSelectedConfidence(data.snipeConfidence);
-        if (data.maxSnipeBuyPrice) setSelectedMaxBuyPrice(data.maxSnipeBuyPrice);
-        if (data.snipeLateWindowSeconds) setSelectedLateZone(data.snipeLateWindowSeconds);
-        if (data.minArbThreshold) setSelectedThreshold(data.minArbThreshold);
-        if (data.riskPercentage) setSelectedRisk(data.riskPercentage);
-        if (data.executionMode) setSelectedExecMode(data.executionMode);
-        if (data.logs) setLogs(data.logs);
-        if (data.trades) setTrades(data.trades);
+        const contentType = res.headers.get('content-type');
+        if (contentType && contentType.includes('application/json')) {
+          const data = await res.json();
+          setState((prev) => ({
+            ...prev,
+            ...data,
+          }));
+          if (data.activeStrategy) setSelectedStrategy(data.activeStrategy);
+          if (data.snipeConfidence) setSelectedConfidence(data.snipeConfidence);
+          if (data.maxSnipeBuyPrice) setSelectedMaxBuyPrice(data.maxSnipeBuyPrice);
+          if (data.snipeLateWindowSeconds) setSelectedLateZone(data.snipeLateWindowSeconds);
+          if (data.minArbThreshold) setSelectedThreshold(data.minArbThreshold);
+          if (data.riskPercentage) setSelectedRisk(data.riskPercentage);
+          if (data.executionMode) setSelectedExecMode(data.executionMode);
+          if (data.logs) setLogs(data.logs);
+          if (data.trades) setTrades(data.trades);
+        }
       }
-    } catch (err) {
-      console.error('فشل في جلب الحالة الأولية:', err);
+    } catch {
+      // Ignore transient errors during server restart/initial boot
     }
   };
 

@@ -2,6 +2,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import express from "express";
+import cors from "cors";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import WebSocket from "ws";
@@ -60,6 +61,7 @@ const orderQueue = new OrderQueue(150);
 const app = express();
 const PORT = 3000;
 
+app.use(cors());
 app.use(express.json());
 
 // Application State: Strictly LIVE Trading Mode
