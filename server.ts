@@ -147,7 +147,23 @@ let lastArbExecutionTime = 0;
 let lastTradeWindowIndex: number | null = null;
 let isBotRunning = false;
 
-// Latency & Cross-Exchange Statistical Arbitrage Metrics
+// Latency & Settlement Sniping Engine State
+let activeStrategy: "SETTLEMENT_SNIPING" | "LATENCY_ARB" = "SETTLEMENT_SNIPING";
+let snipeConfidence = 0.93; // 93% minimum mathematical win confidence
+let maxSnipeBuyPrice = 0.94; // Max buy price ($0.94), locking in at least +6.4% on $1.00 settlement
+let snipeLateWindowSeconds = 180; // Late window zone: last 3 minutes (180s) before expiration
+let minSnipeDeltaUsd = 30; // Minimum $30 confirmed move from strike
+let minArbThreshold = 0.12; // 12% minimum statistical price discrepancy for arb mode
+let riskPercentage = 0.10; // 10% risk allocation per settlement snipe (default)
+let tpTargetDelta = 0.15; // Take Profit: +15 cents
+let stopLossDelta = 0.20; // Stop Loss: -20 cents
+let executionMode: "MAKER_LIMIT" | "SNIPER" = "SNIPER";
+let maxTradesPerWindow = 1; // Strict 1 trade per 15-min cycle
+let tradesInCurrentWindow = 0;
+let lastTradedWindowIndex: number | null = null;
+let latestArbMetrics: LatencyArbMetrics | null = null;
+
+// Latency & Cross-Exchange Statistical Arbitrage & Settlement Sniping Metrics
 interface LatencyArbMetrics {
   binancePrice: number;
   strikePrice: number;
@@ -157,30 +173,26 @@ interface LatencyArbMetrics {
   fairNoPrice: number;
   marketYesPrice: number;
   marketNoPrice: number;
-  yesSpreadGap: number; // Fair YES - Market YES
-  noSpreadGap: number;  // Fair NO - Market NO
-  activeOpportunity: "BUY_UP_ARB" | "BUY_DOWN_ARB" | "NEUTRAL";
+  yesSpreadGap: number;
+  noSpreadGap: number;
+  activeOpportunity: "BUY_UP_ARB" | "BUY_DOWN_ARB" | "SNIPE_UP_SETTLEMENT" | "SNIPE_DOWN_SETTLEMENT" | "NEUTRAL";
   arbEdgePct: number;
   estimatedNetProfitPct: number;
   binanceLatencyMs: number;
   limitlessLatencyMs: number;
-  minArbThreshold: number; // Configurable threshold (e.g. 0.10)
+  minArbThreshold: number;
+  activeStrategy: "SETTLEMENT_SNIPING" | "LATENCY_ARB";
+  winProbabilityPct: number;
+  isSnipingZone: boolean;
+  snipeConfidence: number;
+  maxSnipeBuyPrice: number;
+  snipeLateWindowSeconds: number;
   minute: number;
   windowMinute: number;
   secondsRemainingInWindow: number;
   isWindowActive: boolean;
   time: number;
 }
-
-let minArbThreshold = 0.12; // 12% minimum statistical price discrepancy
-let riskPercentage = 0.04; // 4% risk allocation per trade
-let tpTargetDelta = 0.15; // Take Profit: +15 cents (+35% to +50% gain)
-let stopLossDelta = 0.20; // Stop Loss: -20 cents
-let executionMode: "MAKER_LIMIT" | "SNIPER" = "MAKER_LIMIT";
-let maxTradesPerWindow = 1; // Strict 1 trade per 15-min cycle to prevent spamming
-let tradesInCurrentWindow = 0;
-let lastTradedWindowIndex: number | null = null;
-let latestArbMetrics: LatencyArbMetrics | null = null;
 
 // Position & Trade tracking
 interface PositionTrade {
@@ -203,7 +215,7 @@ interface PositionTrade {
   pnl?: number;
   status: string;
   tokenId?: string;
-  strategyType: "LATENCY_ARB" | "CONVERGENCE_HARVEST";
+  strategyType: "SETTLEMENT_SNIPER" | "LATENCY_ARB" | "CONVERGENCE_HARVEST";
   arbMetrics?: {
     fairPrice: number;
     marketPrice: number;
@@ -298,7 +310,7 @@ function evaluateLatencyArbitrage(currentBtcPrice: number) {
   const zScore = vol > 0 ? priceDeltaUsd / vol : 0;
   let rawFairYes = normalCDF(zScore);
   // Clamping for realistic market pricing
-  rawFairYes = Math.max(0.05, Math.min(0.95, rawFairYes));
+  rawFairYes = Math.max(0.01, Math.min(0.99, rawFairYes));
   
   const fairYesPrice = Number(rawFairYes.toFixed(2));
   const fairNoPrice = Number((1 - fairYesPrice).toFixed(2));
@@ -307,27 +319,52 @@ function evaluateLatencyArbitrage(currentBtcPrice: number) {
   const yesSpreadGap = Number((fairYesPrice - currentYesPrice).toFixed(2));
   const noSpreadGap = Number((fairNoPrice - currentNoPrice).toFixed(2));
 
-  // Arbitrage Opportunity Detection:
-  // Condition 1: Fair Price exceeds Market Price by at least minArbThreshold (e.g. +12%)
-  // Condition 2: Market price must be in reasonable scalping range (0.15 - 0.75) to prevent buying at 90c or worthless 5c
-  // Condition 3: Not in the first 45 seconds (volatility settlement) or last 60 seconds of the window
-  // Condition 4: BTC must have moved at least $35 from strike to avoid 50/50 chop
-  let activeOpportunity: "BUY_UP_ARB" | "BUY_DOWN_ARB" | "NEUTRAL" = "NEUTRAL";
+  // Sniping Window Zone detection (Last X seconds before expiry, e.g. 180s down to 25s)
+  const isSnipingZone = secondsRemainingInWindow <= snipeLateWindowSeconds && secondsRemainingInWindow >= 25;
+  const isWindowActive = secondsRemainingInWindow > 25 && secondsRemainingInWindow < 875;
+  const hasBtcMomentum = Math.abs(priceDeltaUsd) >= minSnipeDeltaUsd;
+
+  let activeOpportunity: "BUY_UP_ARB" | "BUY_DOWN_ARB" | "SNIPE_UP_SETTLEMENT" | "SNIPE_DOWN_SETTLEMENT" | "NEUTRAL" = "NEUTRAL";
   let arbEdgePct = 0;
   let estimatedNetProfitPct = 0;
+  
+  // Win Probability calculation based on direction
+  let winProbabilityPct = 50.0;
+  if (priceDeltaUsd > 0) {
+    winProbabilityPct = Number((rawFairYes * 100).toFixed(1));
+  } else if (priceDeltaUsd < 0) {
+    winProbabilityPct = Number(((1 - rawFairYes) * 100).toFixed(1));
+  }
 
-  const isWindowActive = secondsRemainingInWindow > 60 && secondsRemainingInWindow < 855;
-  const hasBtcMomentum = Math.abs(priceDeltaUsd) >= 30; // Minimum $30 confirmed move
-
-  if (isWindowActive && hasBtcMomentum) {
-    if (yesSpreadGap >= minArbThreshold && currentYesPrice >= 0.15 && currentYesPrice <= 0.75 && priceDeltaUsd > 0) {
-      activeOpportunity = "BUY_UP_ARB";
-      arbEdgePct = Number(((yesSpreadGap / currentYesPrice) * 100).toFixed(1));
-      estimatedNetProfitPct = Number((((fairYesPrice - currentYesPrice) / currentYesPrice) * 100).toFixed(1));
-    } else if (noSpreadGap >= minArbThreshold && currentNoPrice >= 0.15 && currentNoPrice <= 0.75 && priceDeltaUsd < 0) {
-      activeOpportunity = "BUY_DOWN_ARB";
-      arbEdgePct = Number(((noSpreadGap / currentNoPrice) * 100).toFixed(1));
-      estimatedNetProfitPct = Number((((fairNoPrice - currentNoPrice) / currentNoPrice) * 100).toFixed(1));
+  if (activeStrategy === "SETTLEMENT_SNIPING") {
+    // 🎯 SETTLEMENT SNIPING RULES:
+    // 1. Must be in late window zone (e.g. last 180 seconds / 3 mins down to 25s)
+    // 2. BTC price delta must exceed minimum threshold ($30+)
+    // 3. Mathematical win probability must meet or exceed confidence threshold (e.g. >= 93%)
+    // 4. Contract price must be available at or below maxSnipeBuyPrice (e.g. <= $0.94, guaranteeing positive yield)
+    if (isSnipingZone && hasBtcMomentum) {
+      if (priceDeltaUsd > 0 && rawFairYes >= snipeConfidence && currentYesPrice <= maxSnipeBuyPrice && currentYesPrice >= 0.70) {
+        activeOpportunity = "SNIPE_UP_SETTLEMENT";
+        arbEdgePct = Number((((1.00 - currentYesPrice) / currentYesPrice) * 100).toFixed(1));
+        estimatedNetProfitPct = arbEdgePct;
+      } else if (priceDeltaUsd < 0 && (1 - rawFairYes) >= snipeConfidence && currentNoPrice <= maxSnipeBuyPrice && currentNoPrice >= 0.70) {
+        activeOpportunity = "SNIPE_DOWN_SETTLEMENT";
+        arbEdgePct = Number((((1.00 - currentNoPrice) / currentNoPrice) * 100).toFixed(1));
+        estimatedNetProfitPct = arbEdgePct;
+      }
+    }
+  } else {
+    // ⚡ LATENCY ARBITRAGE RULES:
+    if (isWindowActive && hasBtcMomentum) {
+      if (yesSpreadGap >= minArbThreshold && currentYesPrice >= 0.15 && currentYesPrice <= 0.75 && priceDeltaUsd > 0) {
+        activeOpportunity = "BUY_UP_ARB";
+        arbEdgePct = Number(((yesSpreadGap / currentYesPrice) * 100).toFixed(1));
+        estimatedNetProfitPct = Number((((fairYesPrice - currentYesPrice) / currentYesPrice) * 100).toFixed(1));
+      } else if (noSpreadGap >= minArbThreshold && currentNoPrice >= 0.15 && currentNoPrice <= 0.75 && priceDeltaUsd < 0) {
+        activeOpportunity = "BUY_DOWN_ARB";
+        arbEdgePct = Number(((noSpreadGap / currentNoPrice) * 100).toFixed(1));
+        estimatedNetProfitPct = Number((((fairNoPrice - currentNoPrice) / currentNoPrice) * 100).toFixed(1));
+      }
     }
   }
 
@@ -351,6 +388,12 @@ function evaluateLatencyArbitrage(currentBtcPrice: number) {
     binanceLatencyMs,
     limitlessLatencyMs,
     minArbThreshold,
+    activeStrategy,
+    winProbabilityPct,
+    isSnipingZone,
+    snipeConfidence,
+    maxSnipeBuyPrice,
+    snipeLateWindowSeconds,
     minute: currentMinute,
     windowMinute,
     secondsRemainingInWindow,
@@ -360,32 +403,37 @@ function evaluateLatencyArbitrage(currentBtcPrice: number) {
 
   broadcast("latency_arb_update", latestArbMetrics);
 
-  // AUTOMATED LATENCY ARBITRAGE EXECUTION TRIGGER
+  // AUTOMATED EXECUTION TRIGGER (SETTLEMENT SNIPER OR LATENCY ARB)
   if (isBotRunning && isWindowActive && activeOpportunity !== "NEUTRAL") {
     // Strict Execution Rules:
-    // Rule 1: Max 1 position per 15m window to prevent overtrading / balance draining
-    // Rule 2: Minimum 30 seconds cooldown between attempts
+    // Rule 1: Max positions per 15m window to prevent overtrading
+    // Rule 2: Minimum cooldown between attempts
     const canTradeInWindow = tradesInCurrentWindow < maxTradesPerWindow;
-    const cooldownElapsed = Date.now() - lastArbExecutionTime > 30000;
+    const cooldownElapsed = Date.now() - lastArbExecutionTime > 20000;
 
     if (canTradeInWindow && cooldownElapsed) {
       lastArbExecutionTime = Date.now();
       lastTradedWindowIndex = currentWindowIndex;
       tradesInCurrentWindow++;
       
-      const direction: "YES" | "NO" = activeOpportunity === "BUY_UP_ARB" ? "YES" : "NO";
+      const isSnipe = activeOpportunity.includes("SNIPE");
+      const direction: "YES" | "NO" = (activeOpportunity === "SNIPE_UP_SETTLEMENT" || activeOpportunity === "BUY_UP_ARB") ? "YES" : "NO";
       const targetMarketPrice = direction === "YES" ? currentYesPrice : currentNoPrice;
       const targetFairPrice = direction === "YES" ? fairYesPrice : fairNoPrice;
       const spread = direction === "YES" ? yesSpreadGap : noSpreadGap;
 
-      addLog("ALERT", `⚡ [ARBITRAGE OPPORTUNITY TRIGGERED] Direction: ${direction} | Fair: $${targetFairPrice.toFixed(2)} vs Market: $${targetMarketPrice.toFixed(2)} (Edge: +${(spread * 100).toFixed(0)}%) | BTC: $${currentBtcPrice.toFixed(2)} (Δ: $${priceDeltaUsd})`);
+      if (isSnipe) {
+        addLog("ALERT", `🎯 [SETTLEMENT SNIPING TRIGGERED] Direction: ${direction} | Win Confidence: ${winProbabilityPct}% | Price: $${targetMarketPrice.toFixed(2)} -> Payout: $1.00 (+${arbEdgePct}% Yield) | BTC: $${currentBtcPrice.toFixed(2)} (Δ: $${priceDeltaUsd})`);
+      } else {
+        addLog("ALERT", `⚡ [ARBITRAGE OPPORTUNITY TRIGGERED] Direction: ${direction} | Fair: $${targetFairPrice.toFixed(2)} vs Market: $${targetMarketPrice.toFixed(2)} (Edge: +${(spread * 100).toFixed(0)}%) | BTC: $${currentBtcPrice.toFixed(2)} (Δ: $${priceDeltaUsd})`);
+      }
 
-      executeLatencyArbTrade(direction, currentBtcPrice, strike, targetMarketPrice, targetFairPrice, spread, currentWindowIndex);
+      executeLatencyArbTrade(direction, currentBtcPrice, strike, targetMarketPrice, targetFairPrice, spread, currentWindowIndex, isSnipe);
     }
   }
 }
 
-// Order Execution Engine: Supports Strict Limit Maker & Scalping Take-Profit
+// Order Execution Engine: Supports Settlement Sniping & Arbitrage
 async function executeLatencyArbTrade(
   direction: "YES" | "NO",
   binancePrice: number,
@@ -393,10 +441,11 @@ async function executeLatencyArbTrade(
   marketPrice: number,
   fairPrice: number,
   spreadGap: number,
-  windowIndex: number
+  windowIndex: number,
+  isSnipe = false
 ) {
   const currentBalance = liveBalance;
-  // Dynamic Risk Allocation: % of wallet balance per opportunity (default 4%)
+  // Dynamic Risk Allocation: % of wallet balance per opportunity
   let tradeAmount = currentBalance > 0 ? (currentBalance * riskPercentage) : 0;
   tradeAmount = Math.floor(tradeAmount * 100) / 100;
 
@@ -409,11 +458,13 @@ async function executeLatencyArbTrade(
     return;
   }
 
-  // Execution Price Calculation based on selected executionMode:
-  // MAKER_LIMIT: Sets price at or slightly below market to ensure it sits in the book as a LIMIT order without crossing spread
-  // SNIPER: Sets limit price exactly at current ask or capped at fairPrice - 0.05
+  // Execution Price Calculation:
+  // For SETTLEMENT_SNIPING: Buy at current market quote or capped at maxSnipeBuyPrice
+  // For ARB: Limit Maker or Sniper
   let executionPrice: number;
-  if (executionMode === "MAKER_LIMIT") {
+  if (isSnipe) {
+    executionPrice = Number(Math.min(marketPrice, maxSnipeBuyPrice, 0.97).toFixed(2));
+  } else if (executionMode === "MAKER_LIMIT") {
     executionPrice = Number(Math.max(0.15, Math.min(marketPrice, fairPrice - 0.05)).toFixed(2));
   } else {
     executionPrice = Number(Math.min(marketPrice, fairPrice - 0.03, 0.75).toFixed(2));
@@ -434,11 +485,11 @@ async function executeLatencyArbTrade(
     amount: tradeAmount,
     shares,
     mode,
-    orderType: executionMode === "MAKER_LIMIT" ? "LIMIT (MAKER)" : "GTC LIMIT",
+    orderType: isSnipe ? "SETTLEMENT SNIPER (GTC)" : executionMode === "MAKER_LIMIT" ? "LIMIT (MAKER)" : "GTC LIMIT",
     windowIndex,
     targetPayout: Number((shares * 1.00).toFixed(2)),
     status: "PLACED (LIMIT BUY)",
-    strategyType: "LATENCY_ARB",
+    strategyType: isSnipe ? "SETTLEMENT_SNIPER" : "LATENCY_ARB",
     arbMetrics: {
       fairPrice,
       marketPrice,
@@ -1028,7 +1079,12 @@ app.get("/api/state", (req, res) => {
   );
   res.json({
     mode: "LIVE",
-    strategy: "LATENCY_ARBITRAGE_CROSS_EXCHANGE",
+    strategy: activeStrategy,
+    activeStrategy,
+    snipeConfidence,
+    maxSnipeBuyPrice,
+    snipeLateWindowSeconds,
+    minSnipeDeltaUsd,
     currentPrice,
     liveBalance,
     contractSlug: activeContractSlug || 'btc-up-or-down-15-min',
@@ -1055,17 +1111,45 @@ app.post("/api/toggle", async (req, res) => {
   if (typeof running === "boolean") {
     isBotRunning = running;
     broadcast("bot_status", { isBotRunning });
-    addLog("INFO", `⚡ Latency Arbitrage & Scalping Engine ${isBotRunning ? 'STARTED (LIVE)' : 'STOPPED'}`);
+    const stratName = activeStrategy === "SETTLEMENT_SNIPING" ? "🎯 Settlement Sniping (قنص التسوية 95%+)" : "⚡ Latency Arbitrage (مراجحة الفروقات السعرية)";
+    addLog("INFO", `⚡ Bot Engine ${isBotRunning ? 'STARTED (LIVE)' : 'STOPPED'} - Strategy: ${stratName}`);
   }
   res.json({ success: true, isBotRunning });
 });
 
 app.post("/api/settings", async (req, res) => {
-  const { threshold, risk, tpTarget, stopLoss, mode: execMode, maxTrades } = req.body;
+  const { 
+    strategy, 
+    snipeConfidence: newConfidence, 
+    maxSnipeBuyPrice: newMaxPrice, 
+    snipeLateWindowSeconds: newLateZone,
+    threshold, 
+    risk, 
+    tpTarget, 
+    stopLoss, 
+    mode: execMode, 
+    maxTrades 
+  } = req.body;
+
+  if (strategy === "SETTLEMENT_SNIPING" || strategy === "LATENCY_ARB") {
+    activeStrategy = strategy;
+    addLog("INFO", `🎯 Strategy Mode switched to: ${activeStrategy === "SETTLEMENT_SNIPING" ? "Settlement Sniping (قنص التسوية 95%+)" : "Latency Arbitrage (مراجحة الفروقات السعرية)"}`);
+  }
+  if (typeof newConfidence === "number" && newConfidence >= 0.80 && newConfidence <= 0.99) {
+    snipeConfidence = newConfidence;
+    addLog("INFO", `🎯 Sniping Confidence Threshold set to: ${(snipeConfidence * 100).toFixed(0)}%`);
+  }
+  if (typeof newMaxPrice === "number" && newMaxPrice >= 0.80 && newMaxPrice <= 0.98) {
+    maxSnipeBuyPrice = newMaxPrice;
+    addLog("INFO", `🎯 Max Snipe Buy Price set to: $${maxSnipeBuyPrice.toFixed(2)} (Min yield: +${(((1 - maxSnipeBuyPrice) / maxSnipeBuyPrice) * 100).toFixed(1)}%)`);
+  }
+  if (typeof newLateZone === "number" && newLateZone >= 45 && newLateZone <= 360) {
+    snipeLateWindowSeconds = newLateZone;
+    addLog("INFO", `⏱️ Sniping Late Window Zone set to: Last ${snipeLateWindowSeconds}s (${(snipeLateWindowSeconds / 60).toFixed(1)}m) before settlement.`);
+  }
   if (typeof threshold === "number" && threshold >= 0.03 && threshold <= 0.50) {
     minArbThreshold = threshold;
     addLog("INFO", `⚙️ Arbitrage Trigger Threshold updated to: ${(minArbThreshold * 100).toFixed(0)}%`);
-    if (currentPrice > 0) evaluateLatencyArbitrage(currentPrice);
   }
   if (typeof risk === "number" && risk >= 0.01 && risk <= 0.50) {
     riskPercentage = risk;
@@ -1073,21 +1157,34 @@ app.post("/api/settings", async (req, res) => {
   }
   if (typeof tpTarget === "number" && tpTarget >= 0.05 && tpTarget <= 0.40) {
     tpTargetDelta = tpTarget;
-    addLog("INFO", `🎯 Take-Profit Target updated to: +${(tpTargetDelta * 100).toFixed(0)}¢ above entry.`);
   }
   if (typeof stopLoss === "number" && stopLoss >= 0.05 && stopLoss <= 0.50) {
     stopLossDelta = stopLoss;
-    addLog("INFO", `🛑 Stop-Loss Threshold updated to: -${(stopLossDelta * 100).toFixed(0)}¢ below entry.`);
   }
   if (execMode === "MAKER_LIMIT" || execMode === "SNIPER") {
     executionMode = execMode;
-    addLog("INFO", `⚡ Execution Mode set to: ${executionMode === "MAKER_LIMIT" ? "Maker Limit (أمر محدد فقط)" : "Sniper (قناص سريع)"}`);
   }
   if (typeof maxTrades === "number" && maxTrades >= 1 && maxTrades <= 5) {
     maxTradesPerWindow = maxTrades;
   }
-  broadcast("settings_update", { minArbThreshold, riskPercentage, tpTargetDelta, stopLossDelta, executionMode, maxTradesPerWindow });
-  res.json({ success: true, minArbThreshold, riskPercentage, tpTargetDelta, stopLossDelta, executionMode, maxTradesPerWindow });
+
+  if (currentPrice > 0) evaluateLatencyArbitrage(currentPrice);
+
+  const payload = {
+    activeStrategy,
+    snipeConfidence,
+    maxSnipeBuyPrice,
+    snipeLateWindowSeconds,
+    minArbThreshold,
+    riskPercentage,
+    tpTargetDelta,
+    stopLossDelta,
+    executionMode,
+    maxTradesPerWindow
+  };
+
+  broadcast("settings_update", payload);
+  res.json({ success: true, ...payload });
 });
 
 app.post("/api/cancel-orders", async (req, res) => {
